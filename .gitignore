@@ -1,0 +1,19 @@
+# Build directory
+build/
+
+# Generated files
+*.o
+*.out
+miner.log
+blockchain.dat
+wallets.dat
+
+# IDE specific files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS specific files
+.DS_Store
+Thumbs.db
