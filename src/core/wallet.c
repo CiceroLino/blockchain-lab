@@ -5,7 +5,8 @@
 #include <openssl/core_names.h>
 #include <openssl/param_build.h>
 #include <openssl/err.h>
-#include <openssl/provider.h>
+#include <openssl/crypto.h>
+#include <openssl/obj_mac.h>
 #include "wallet.h"
 #include "../utils/logging.h"
 #include "../utils/crypto.h"
@@ -47,6 +48,12 @@ Wallet *create_wallet(Blockchain *chain)
 {
   log_message(LOG_DEBUG, "Iniciando criação de carteira...");
 
+  // Inicialização do OpenSSL
+  OPENSSL_init_crypto(OPENSSL_INIT_ADD_ALL_CIPHERS |
+                          OPENSSL_INIT_ADD_ALL_DIGESTS |
+                          OPENSSL_INIT_LOAD_CONFIG,
+                      NULL);
+
   if (!chain)
   {
     log_message(LOG_ERROR, "Chain é NULL");
@@ -54,8 +61,15 @@ Wallet *create_wallet(Blockchain *chain)
   }
 
   log_message(LOG_DEBUG, "Chain válido, verificando versão OpenSSL...");
-  log_message(LOG_DEBUG, "OpenSSL version: %s", OPENSSL_VERSION_TEXT);
-  log_message(LOG_DEBUG, "OpenSSL version number: 0x%lx", OpenSSL_version_num());
+  const char *version = OpenSSL_version(OPENSSL_VERSION);
+  const char *version_text = OPENSSL_VERSION_TEXT;
+  log_message(LOG_DEBUG, "OpenSSL version (OPENSSL_VERSION_TEXT): %s",
+              version_text ? version_text : "unknown");
+  log_message(LOG_DEBUG, "OpenSSL version (OpenSSL_version): %s",
+              version ? version : "unknown");
+
+  // log_message(LOG_DEBUG, "OpenSSL version (OPENSSL_VERSION_TEXT): %s", OPENSSL_VERSION_TEXT);
+  // log_message(LOG_DEBUG, "OpenSSL version (OpenSSL_version): %s", OpenSSL_version(OPENSSL_VERSION));
 
   if (chain->wallet_count >= MAX_WALLETS)
   {
@@ -75,6 +89,25 @@ Wallet *create_wallet(Blockchain *chain)
     return NULL;
   }
 
+  // Verificar se o grupo é válido
+  if (!EC_GROUP_check(group, NULL))
+  {
+    log_message(LOG_ERROR, "Grupo da curva é inválido");
+    print_openssl_error();
+    EC_GROUP_free(group);
+    return NULL;
+  }
+
+  // Verificar o nome da curva
+  const char *curve_name = OBJ_nid2sn(EC_GROUP_get_curve_name(group));
+  log_message(LOG_DEBUG, "Nome da curva: %s", curve_name ? curve_name : "desconhecido");
+
+  log_message(LOG_DEBUG, "Grupo da curva criado com sucesso");
+
+  // Verificar informações do grupo
+  int curve_degree = EC_GROUP_get_degree(group);
+  log_message(LOG_DEBUG, "Grau da curva: %d bits", curve_degree);
+
   // Criar o par de chaves EC
   EC_KEY *ec_key = EC_KEY_new();
   if (!ec_key)
@@ -85,6 +118,8 @@ Wallet *create_wallet(Blockchain *chain)
     return NULL;
   }
 
+  log_message(LOG_DEBUG, "EC_KEY criado com sucesso");
+
   if (!EC_KEY_set_group(ec_key, group))
   {
     log_message(LOG_ERROR, "Falha ao definir grupo para EC_KEY");
@@ -93,6 +128,8 @@ Wallet *create_wallet(Blockchain *chain)
     EC_GROUP_free(group);
     return NULL;
   }
+
+  log_message(LOG_DEBUG, "Grupo definido para EC_KEY");
 
   // Gerar o par de chaves
   if (!EC_KEY_generate_key(ec_key))
@@ -104,171 +141,63 @@ Wallet *create_wallet(Blockchain *chain)
     return NULL;
   }
 
-  // Converter para EVP_PKEY
-  EVP_PKEY *pkey = EVP_PKEY_new();
-  if (!pkey || !EVP_PKEY_assign_EC_KEY(pkey, ec_key))
+  log_message(LOG_DEBUG, "Par de chaves EC gerado com sucesso");
+
+  // Verificar a chave privada
+  const BIGNUM *priv_key = EC_KEY_get0_private_key(ec_key);
+  if (!priv_key)
   {
-    log_message(LOG_ERROR, "Falha ao converter para EVP_PKEY");
+    log_message(LOG_ERROR, "Chave privada não foi gerada");
     print_openssl_error();
     EC_KEY_free(ec_key);
     EC_GROUP_free(group);
     return NULL;
   }
 
-  // Carregar providers
-  OSSL_PROVIDER *default_provider = OSSL_PROVIDER_load(NULL, "default");
-  if (!default_provider)
+  // Imprimir o tamanho da chave privada em bits
+  log_message(LOG_DEBUG, "Tamanho da chave privada: %d bits", BN_num_bits(priv_key));
+
+  // Verificar a chave pública gerada
+  const EC_POINT *pub_key = EC_KEY_get0_public_key(ec_key);
+  if (!pub_key)
   {
-    log_message(LOG_ERROR, "Falha ao carregar provider default");
+    log_message(LOG_ERROR, "Falha ao obter chave pública do EC_KEY");
     print_openssl_error();
+    EC_KEY_free(ec_key);
+    EC_GROUP_free(group);
     return NULL;
   }
 
-  OSSL_PROVIDER *legacy_provider = OSSL_PROVIDER_load(NULL, "legacy");
-  if (!legacy_provider)
+  // Verificar o formato da chave pública
+  point_conversion_form_t form = EC_KEY_get_conv_form(ec_key);
+  log_message(LOG_DEBUG, "Formato da chave pública: %d", (int)form);
+
+  // Verificar o tamanho esperado da chave pública
+  size_t expected_size = EC_POINT_point2oct(group, pub_key, form, NULL, 0, NULL);
+  log_message(LOG_DEBUG, "Tamanho esperado da chave pública: %zu bytes", expected_size);
+
+  // Converter para EVP_PKEY para usar as funções de extração de chaves
+  EVP_PKEY *pkey = EVP_PKEY_new();
+  if (!pkey)
   {
-    log_message(LOG_ERROR, "Falha ao carregar provider legacy");
+    log_message(LOG_ERROR, "Falha ao criar EVP_PKEY");
     print_openssl_error();
-    OSSL_PROVIDER_unload(default_provider);
+    EC_KEY_free(ec_key);
+    EC_GROUP_free(group);
     return NULL;
   }
 
-  OSSL_PARAM_BLD *param_bld = OSSL_PARAM_BLD_new();
-  if (!param_bld)
+  if (!EVP_PKEY_assign_EC_KEY(pkey, ec_key))
   {
-    log_message(LOG_ERROR, "Falha ao criar construtor de parâmetros");
-    print_openssl_error();
-    OSSL_PROVIDER_unload(legacy_provider);
-    OSSL_PROVIDER_unload(default_provider);
-    return NULL;
-  }
-
-  if (!OSSL_PARAM_BLD_push_utf8_string(param_bld, OSSL_PKEY_PARAM_GROUP_NAME, "secp256k1", 0))
-  {
-    log_message(LOG_ERROR, "Falha ao definir curva secp256k1");
-    print_openssl_error();
-    OSSL_PARAM_BLD_free(param_bld);
-    OSSL_PROVIDER_unload(legacy_provider);
-    OSSL_PROVIDER_unload(default_provider);
-    return NULL;
-  }
-
-  log_message(LOG_DEBUG, "Parâmetros da curva configurados");
-
-  OSSL_PARAM *params = OSSL_PARAM_BLD_to_param(param_bld);
-  if (!params)
-  {
-    log_message(LOG_ERROR, "Falha ao criar parâmetros");
-    print_openssl_error();
-    OSSL_PARAM_BLD_free(param_bld);
-    OSSL_PROVIDER_unload(legacy_provider);
-    OSSL_PROVIDER_unload(default_provider);
-    return NULL;
-  }
-
-  EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, NULL);
-  if (!ctx)
-  {
-    log_message(LOG_ERROR, "Falha ao criar contexto EVP");
-    print_openssl_error();
-    OSSL_PARAM_free(params);
-    OSSL_PARAM_BLD_free(param_bld);
-    OSSL_PROVIDER_unload(legacy_provider);
-    OSSL_PROVIDER_unload(default_provider);
-    return NULL;
-  }
-
-  if (!EVP_PKEY_CTX_is_a(ctx, "EC"))
-  {
-    log_message(LOG_ERROR, "Contexto não suporta curvas elípticas");
-    print_openssl_error();
-    EVP_PKEY_CTX_free(ctx);
-    OSSL_PARAM_free(params);
-    OSSL_PARAM_BLD_free(param_bld);
-    OSSL_PROVIDER_unload(legacy_provider);
-    OSSL_PROVIDER_unload(default_provider);
-    return NULL;
-  }
-
-  log_message(LOG_DEBUG, "Contexto EVP criado");
-
-  if (EVP_PKEY_keygen_init(ctx) <= 0)
-  {
-    log_message(LOG_ERROR, "Falha ao inicializar gerador de chave");
-    print_openssl_error();
-    EVP_PKEY_CTX_free(ctx);
-    OSSL_PARAM_free(params);
-    OSSL_PARAM_BLD_free(param_bld);
-    OSSL_PROVIDER_unload(legacy_provider);
-    OSSL_PROVIDER_unload(default_provider);
-    return NULL;
-  }
-
-  if (EVP_PKEY_CTX_set_params(ctx, params) <= 0)
-  {
-    log_message(LOG_ERROR, "Falha ao definir parâmetros");
-    print_openssl_error();
-    EVP_PKEY_CTX_free(ctx);
-    OSSL_PARAM_free(params);
-    OSSL_PARAM_BLD_free(param_bld);
-    OSSL_PROVIDER_unload(legacy_provider);
-    OSSL_PROVIDER_unload(default_provider);
-    return NULL;
-  }
-
-  log_message(LOG_DEBUG, "Parâmetros definidos no contexto");
-
-  EVP_PKEY *pkey = NULL;
-  if (EVP_PKEY_generate(ctx, &pkey) <= 0 || !pkey)
-  {
-    log_message(LOG_ERROR, "Falha ao gerar par de chaves ou pkey é NULL");
-    print_openssl_error();
-    EVP_PKEY_CTX_free(ctx);
-    OSSL_PARAM_free(params);
-    OSSL_PARAM_BLD_free(param_bld);
-    OSSL_PROVIDER_unload(legacy_provider);
-    OSSL_PROVIDER_unload(default_provider);
-    return NULL;
-  }
-
-  log_message(LOG_DEBUG, "Par de chaves gerado com sucesso");
-
-  if (!EVP_PKEY_is_a(pkey, "EC"))
-  {
-    log_message(LOG_ERROR, "A chave gerada não é do tipo EC");
+    log_message(LOG_ERROR, "Falha ao atribuir EC_KEY ao EVP_PKEY");
     print_openssl_error();
     EVP_PKEY_free(pkey);
-    EVP_PKEY_CTX_free(ctx);
-    OSSL_PARAM_free(params);
-    OSSL_PARAM_BLD_free(param_bld);
-    OSSL_PROVIDER_unload(legacy_provider);
-    OSSL_PROVIDER_unload(default_provider);
+    EC_KEY_free(ec_key);
+    EC_GROUP_free(group);
     return NULL;
   }
 
-  if (!EVP_PKEY_get_utf8_string_param(pkey, OSSL_PKEY_PARAM_GROUP_NAME, NULL, 0, NULL))
-  {
-    log_message(LOG_ERROR, "Falha ao verificar nome da curva");
-    print_openssl_error();
-  }
-
-  BIGNUM *order = NULL;
-  if (!EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_EC_ORDER, &order))
-  {
-    log_message(LOG_ERROR, "Falha ao obter ordem da curva");
-    print_openssl_error();
-  }
-  if (order)
-    BN_free(order);
-
-  log_message(LOG_DEBUG, "Tipo da chave: %s",
-              EVP_PKEY_get0_type_name(pkey) ? EVP_PKEY_get0_type_name(pkey) : "desconhecido");
-
-  int key_size = EVP_PKEY_size(pkey);
-  log_message(LOG_DEBUG, "Tamanho total da chave: %d bytes", key_size);
-
-  int key_bits = EVP_PKEY_bits(pkey);
-  log_message(LOG_DEBUG, "Bits da chave: %d", key_bits);
+  log_message(LOG_DEBUG, "Chaves convertidas para EVP_PKEY com sucesso");
 
   size_t pub_len = 0;
   log_message(LOG_DEBUG, "Tentando determinar tamanho da chave pública...");
@@ -278,11 +207,7 @@ Wallet *create_wallet(Blockchain *chain)
     log_message(LOG_ERROR, "Falha ao determinar tamanho da chave pública");
     print_openssl_error();
     EVP_PKEY_free(pkey);
-    EVP_PKEY_CTX_free(ctx);
-    OSSL_PARAM_free(params);
-    OSSL_PARAM_BLD_free(param_bld);
-    OSSL_PROVIDER_unload(legacy_provider);
-    OSSL_PROVIDER_unload(default_provider);
+    EC_GROUP_free(group);
     return NULL;
   }
 
@@ -293,11 +218,7 @@ Wallet *create_wallet(Blockchain *chain)
     log_message(LOG_ERROR, "Buffer da chave pública muito pequeno (%zu > %zu)",
                 pub_len, sizeof(wallet->public_key));
     EVP_PKEY_free(pkey);
-    EVP_PKEY_CTX_free(ctx);
-    OSSL_PARAM_free(params);
-    OSSL_PARAM_BLD_free(param_bld);
-    OSSL_PROVIDER_unload(legacy_provider);
-    OSSL_PROVIDER_unload(default_provider);
+    EC_GROUP_free(group);
     return NULL;
   }
 
@@ -306,11 +227,7 @@ Wallet *create_wallet(Blockchain *chain)
     log_message(LOG_ERROR, "Falha ao extrair chave pública");
     print_openssl_error();
     EVP_PKEY_free(pkey);
-    EVP_PKEY_CTX_free(ctx);
-    OSSL_PARAM_free(params);
-    OSSL_PARAM_BLD_free(param_bld);
-    OSSL_PROVIDER_unload(legacy_provider);
-    OSSL_PROVIDER_unload(default_provider);
+    EC_GROUP_free(group);
     return NULL;
   }
 
@@ -323,11 +240,7 @@ Wallet *create_wallet(Blockchain *chain)
     log_message(LOG_ERROR, "Falha ao determinar tamanho da chave privada");
     print_openssl_error();
     EVP_PKEY_free(pkey);
-    EVP_PKEY_CTX_free(ctx);
-    OSSL_PARAM_free(params);
-    OSSL_PARAM_BLD_free(param_bld);
-    OSSL_PROVIDER_unload(legacy_provider);
-    OSSL_PROVIDER_unload(default_provider);
+    EC_GROUP_free(group);
     return NULL;
   }
 
@@ -336,11 +249,7 @@ Wallet *create_wallet(Blockchain *chain)
     log_message(LOG_ERROR, "Buffer da chave privada muito pequeno (%zu > %zu)",
                 priv_len, sizeof(wallet->private_key));
     EVP_PKEY_free(pkey);
-    EVP_PKEY_CTX_free(ctx);
-    OSSL_PARAM_free(params);
-    OSSL_PARAM_BLD_free(param_bld);
-    OSSL_PROVIDER_unload(legacy_provider);
-    OSSL_PROVIDER_unload(default_provider);
+    EC_GROUP_free(group);
     return NULL;
   }
 
@@ -349,11 +258,7 @@ Wallet *create_wallet(Blockchain *chain)
     log_message(LOG_ERROR, "Falha ao extrair chave privada");
     print_openssl_error();
     EVP_PKEY_free(pkey);
-    EVP_PKEY_CTX_free(ctx);
-    OSSL_PARAM_free(params);
-    OSSL_PARAM_BLD_free(param_bld);
-    OSSL_PROVIDER_unload(legacy_provider);
-    OSSL_PROVIDER_unload(default_provider);
+    EC_GROUP_free(group);
     return NULL;
   }
 
@@ -366,11 +271,7 @@ Wallet *create_wallet(Blockchain *chain)
   wallet->transaction_count = 0;
 
   EVP_PKEY_free(pkey);
-  EVP_PKEY_CTX_free(ctx);
-  OSSL_PARAM_free(params);
-  OSSL_PARAM_BLD_free(param_bld);
-  OSSL_PROVIDER_unload(legacy_provider);
-  OSSL_PROVIDER_unload(default_provider);
+  EC_GROUP_free(group);
 
   log_message(LOG_INFO, "Nova carteira criada com endereço: %s", wallet->address);
   return wallet;
