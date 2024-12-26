@@ -48,28 +48,11 @@ Wallet *create_wallet(Blockchain *chain)
 {
   log_message(LOG_DEBUG, "Iniciando criação de carteira...");
 
-  // Inicialização do OpenSSL
-  OPENSSL_init_crypto(OPENSSL_INIT_ADD_ALL_CIPHERS |
-                          OPENSSL_INIT_ADD_ALL_DIGESTS |
-                          OPENSSL_INIT_LOAD_CONFIG,
-                      NULL);
-
   if (!chain)
   {
     log_message(LOG_ERROR, "Chain é NULL");
     return NULL;
   }
-
-  log_message(LOG_DEBUG, "Chain válido, verificando versão OpenSSL...");
-  const char *version = OpenSSL_version(OPENSSL_VERSION);
-  const char *version_text = OPENSSL_VERSION_TEXT;
-  log_message(LOG_DEBUG, "OpenSSL version (OPENSSL_VERSION_TEXT): %s",
-              version_text ? version_text : "unknown");
-  log_message(LOG_DEBUG, "OpenSSL version (OpenSSL_version): %s",
-              version ? version : "unknown");
-
-  // log_message(LOG_DEBUG, "OpenSSL version (OPENSSL_VERSION_TEXT): %s", OPENSSL_VERSION_TEXT);
-  // log_message(LOG_DEBUG, "OpenSSL version (OpenSSL_version): %s", OpenSSL_version(OPENSSL_VERSION));
 
   if (chain->wallet_count >= MAX_WALLETS)
   {
@@ -77,201 +60,125 @@ Wallet *create_wallet(Blockchain *chain)
     return NULL;
   }
 
-  ERR_clear_error();
   Wallet *wallet = &chain->wallets[chain->wallet_count++];
 
-  // Criar o grupo da curva diretamente
+  // Criar um contexto BN
+  BN_CTX *bn_ctx = BN_CTX_new();
+  if (!bn_ctx)
+  {
+    log_message(LOG_ERROR, "Falha ao criar contexto BN");
+    return NULL;
+  }
+
+  // Criar o grupo da curva
   EC_GROUP *group = EC_GROUP_new_by_curve_name(NID_secp256k1);
   if (!group)
   {
     log_message(LOG_ERROR, "Falha ao criar grupo da curva");
-    print_openssl_error();
+    BN_CTX_free(bn_ctx);
     return NULL;
   }
 
-  // Verificar se o grupo é válido
-  if (!EC_GROUP_check(group, NULL))
+  // Criar um ponto para a chave pública
+  EC_POINT *pub_point = EC_POINT_new(group);
+  if (!pub_point)
   {
-    log_message(LOG_ERROR, "Grupo da curva é inválido");
-    print_openssl_error();
+    log_message(LOG_ERROR, "Falha ao criar ponto EC");
     EC_GROUP_free(group);
+    BN_CTX_free(bn_ctx);
     return NULL;
   }
 
-  // Verificar o nome da curva
-  const char *curve_name = OBJ_nid2sn(EC_GROUP_get_curve_name(group));
-  log_message(LOG_DEBUG, "Nome da curva: %s", curve_name ? curve_name : "desconhecido");
-
-  log_message(LOG_DEBUG, "Grupo da curva criado com sucesso");
-
-  // Verificar informações do grupo
-  int curve_degree = EC_GROUP_get_degree(group);
-  log_message(LOG_DEBUG, "Grau da curva: %d bits", curve_degree);
-
-  // Criar o par de chaves EC
-  EC_KEY *ec_key = EC_KEY_new();
-  if (!ec_key)
-  {
-    log_message(LOG_ERROR, "Falha ao criar estrutura EC_KEY");
-    print_openssl_error();
-    EC_GROUP_free(group);
-    return NULL;
-  }
-
-  log_message(LOG_DEBUG, "EC_KEY criado com sucesso");
-
-  if (!EC_KEY_set_group(ec_key, group))
-  {
-    log_message(LOG_ERROR, "Falha ao definir grupo para EC_KEY");
-    print_openssl_error();
-    EC_KEY_free(ec_key);
-    EC_GROUP_free(group);
-    return NULL;
-  }
-
-  log_message(LOG_DEBUG, "Grupo definido para EC_KEY");
-
-  // Gerar o par de chaves
-  if (!EC_KEY_generate_key(ec_key))
-  {
-    log_message(LOG_ERROR, "Falha ao gerar par de chaves");
-    print_openssl_error();
-    EC_KEY_free(ec_key);
-    EC_GROUP_free(group);
-    return NULL;
-  }
-
-  log_message(LOG_DEBUG, "Par de chaves EC gerado com sucesso");
-
-  // Verificar a chave privada
-  const BIGNUM *priv_key = EC_KEY_get0_private_key(ec_key);
+  // Gerar chave privada (número aleatório)
+  BIGNUM *priv_key = BN_new();
   if (!priv_key)
   {
-    log_message(LOG_ERROR, "Chave privada não foi gerada");
-    print_openssl_error();
-    EC_KEY_free(ec_key);
+    log_message(LOG_ERROR, "Falha ao criar BIGNUM para chave privada");
+    EC_POINT_free(pub_point);
     EC_GROUP_free(group);
+    BN_CTX_free(bn_ctx);
     return NULL;
   }
 
-  // Imprimir o tamanho da chave privada em bits
-  log_message(LOG_DEBUG, "Tamanho da chave privada: %d bits", BN_num_bits(priv_key));
-
-  // Verificar a chave pública gerada
-  const EC_POINT *pub_key = EC_KEY_get0_public_key(ec_key);
-  if (!pub_key)
+  // Obter a ordem da curva
+  BIGNUM *order = BN_new();
+  if (!EC_GROUP_get_order(group, order, bn_ctx))
   {
-    log_message(LOG_ERROR, "Falha ao obter chave pública do EC_KEY");
-    print_openssl_error();
-    EC_KEY_free(ec_key);
+    log_message(LOG_ERROR, "Falha ao obter ordem da curva");
+    BN_free(priv_key);
+    EC_POINT_free(pub_point);
     EC_GROUP_free(group);
+    BN_CTX_free(bn_ctx);
     return NULL;
   }
 
-  // Verificar o formato da chave pública
-  point_conversion_form_t form = EC_KEY_get_conv_form(ec_key);
-  log_message(LOG_DEBUG, "Formato da chave pública: %d", (int)form);
-
-  // Verificar o tamanho esperado da chave pública
-  size_t expected_size = EC_POINT_point2oct(group, pub_key, form, NULL, 0, NULL);
-  log_message(LOG_DEBUG, "Tamanho esperado da chave pública: %zu bytes", expected_size);
-
-  // Converter para EVP_PKEY para usar as funções de extração de chaves
-  EVP_PKEY *pkey = EVP_PKEY_new();
-  if (!pkey)
+  // Gerar número aleatório para chave privada
+  if (!BN_rand_range(priv_key, order))
   {
-    log_message(LOG_ERROR, "Falha ao criar EVP_PKEY");
-    print_openssl_error();
-    EC_KEY_free(ec_key);
+    log_message(LOG_ERROR, "Falha ao gerar número aleatório");
+    BN_free(order);
+    BN_free(priv_key);
+    EC_POINT_free(pub_point);
     EC_GROUP_free(group);
+    BN_CTX_free(bn_ctx);
     return NULL;
   }
 
-  if (!EVP_PKEY_assign_EC_KEY(pkey, ec_key))
+  // Calcular chave pública: Q = d * G
+  if (!EC_POINT_mul(group, pub_point, priv_key, NULL, NULL, bn_ctx))
   {
-    log_message(LOG_ERROR, "Falha ao atribuir EC_KEY ao EVP_PKEY");
-    print_openssl_error();
-    EVP_PKEY_free(pkey);
-    EC_KEY_free(ec_key);
+    log_message(LOG_ERROR, "Falha ao calcular chave pública");
+    BN_free(order);
+    BN_free(priv_key);
+    EC_POINT_free(pub_point);
     EC_GROUP_free(group);
+    BN_CTX_free(bn_ctx);
     return NULL;
   }
 
-  log_message(LOG_DEBUG, "Chaves convertidas para EVP_PKEY com sucesso");
-
-  size_t pub_len = 0;
-  log_message(LOG_DEBUG, "Tentando determinar tamanho da chave pública...");
-
-  if (EVP_PKEY_get_raw_public_key(pkey, NULL, &pub_len) <= 0)
+  // Converter chave privada para bytes
+  int priv_len = BN_num_bytes(priv_key);
+  if (priv_len > (int)sizeof(wallet->private_key))
   {
-    log_message(LOG_ERROR, "Falha ao determinar tamanho da chave pública");
-    print_openssl_error();
-    EVP_PKEY_free(pkey);
+    log_message(LOG_ERROR, "Chave privada muito grande");
+    BN_free(order);
+    BN_free(priv_key);
+    EC_POINT_free(pub_point);
     EC_GROUP_free(group);
+    BN_CTX_free(bn_ctx);
     return NULL;
   }
+  BN_bn2bin(priv_key, wallet->private_key);
 
-  log_message(LOG_DEBUG, "Tamanho necessário para chave pública: %zu bytes", pub_len);
-
-  if (pub_len > sizeof(wallet->public_key))
+  // Converter chave pública para bytes
+  size_t pub_len = EC_POINT_point2oct(group, pub_point, POINT_CONVERSION_UNCOMPRESSED,
+                                      wallet->public_key, sizeof(wallet->public_key), bn_ctx);
+  if (pub_len == 0)
   {
-    log_message(LOG_ERROR, "Buffer da chave pública muito pequeno (%zu > %zu)",
-                pub_len, sizeof(wallet->public_key));
-    EVP_PKEY_free(pkey);
+    log_message(LOG_ERROR, "Falha ao converter chave pública");
+    BN_free(order);
+    BN_free(priv_key);
+    EC_POINT_free(pub_point);
     EC_GROUP_free(group);
+    BN_CTX_free(bn_ctx);
     return NULL;
   }
 
-  if (EVP_PKEY_get_raw_public_key(pkey, wallet->public_key, &pub_len) <= 0)
-  {
-    log_message(LOG_ERROR, "Falha ao extrair chave pública");
-    print_openssl_error();
-    EVP_PKEY_free(pkey);
-    EC_GROUP_free(group);
-    return NULL;
-  }
+  print_hex("Chave privada", wallet->private_key, priv_len);
+  print_hex("Chave pública", wallet->public_key, pub_len);
 
-  print_hex("Chave pública extraída", wallet->public_key, pub_len);
-  log_message(LOG_DEBUG, "Chave pública extraída com sucesso (tamanho: %zu)", pub_len);
+  // Limpar e liberar recursos
+  BN_free(order);
+  BN_free(priv_key);
+  EC_POINT_free(pub_point);
+  EC_GROUP_free(group);
+  BN_CTX_free(bn_ctx);
 
-  size_t priv_len = 0;
-  if (EVP_PKEY_get_raw_private_key(pkey, NULL, &priv_len) <= 0)
-  {
-    log_message(LOG_ERROR, "Falha ao determinar tamanho da chave privada");
-    print_openssl_error();
-    EVP_PKEY_free(pkey);
-    EC_GROUP_free(group);
-    return NULL;
-  }
-
-  if (priv_len > sizeof(wallet->private_key))
-  {
-    log_message(LOG_ERROR, "Buffer da chave privada muito pequeno (%zu > %zu)",
-                priv_len, sizeof(wallet->private_key));
-    EVP_PKEY_free(pkey);
-    EC_GROUP_free(group);
-    return NULL;
-  }
-
-  if (EVP_PKEY_get_raw_private_key(pkey, wallet->private_key, &priv_len) <= 0)
-  {
-    log_message(LOG_ERROR, "Falha ao extrair chave privada");
-    print_openssl_error();
-    EVP_PKEY_free(pkey);
-    EC_GROUP_free(group);
-    return NULL;
-  }
-
-  print_hex("Chave privada extraída", wallet->private_key, priv_len);
-  log_message(LOG_DEBUG, "Chave privada extraída com sucesso (tamanho: %zu)", priv_len);
-
+  // Inicializar campos restantes
   generate_wallet_address(wallet->public_key, wallet->address);
   wallet->balance = 0.0;
   wallet->transaction_history = malloc(sizeof(Transaction) * 1000);
   wallet->transaction_count = 0;
-
-  EVP_PKEY_free(pkey);
-  EC_GROUP_free(group);
 
   log_message(LOG_INFO, "Nova carteira criada com endereço: %s", wallet->address);
   return wallet;
